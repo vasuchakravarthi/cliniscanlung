@@ -47,7 +47,7 @@ def show_header():
     - 📊 Get **overall classification**: Abnormal vs Normal (EfficientNet-B3, Acc: 95.20%)
     - 🧠 View **Grad-CAM heatmap** showing model focus areas
 
-    **Note**: Classification trained on 512×�12 images, optimized for chest X-ray analysis.
+    **Note**: Classification trained on 512×512 images, optimized for chest X-ray analysis.
     """)
 
     with st.sidebar:
@@ -207,7 +207,6 @@ def load_models():
         elif "state_dict" in checkpoint:
             state_dict = checkpoint["state_dict"]
         else:
-            # Assume it is already a state dict
             state_dict = checkpoint
     else:
         state_dict = checkpoint
@@ -239,6 +238,132 @@ transform = transforms.Compose([
         [0.229, 0.224, 0.225]
     )
 ])
+
+
+# --------------------------------------------------
+# GRAD-CAM IMPLEMENTATION
+# --------------------------------------------------
+
+def find_last_conv_layer(model):
+    """
+    Find the last convolutional layer in a timm EfficientNet-like model.
+    """
+    last_conv = None
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.Conv2d)):
+            last_conv = (name, module)
+    return last_conv
+
+
+def compute_gradcam(model, img_tensor, target_class):
+    """
+    Compute Grad-CAM for a given image tensor and target class.
+    model: EfficientNetClassifier (eval mode)
+    img_tensor: (C, H, W) tensor, already normalized
+    target_class: 0 or 1
+    """
+    model.eval()
+    img_tensor = img_tensor.unsqueeze(0).requires_grad_(True)  # (1, C, H, W)
+
+    last_conv_name, last_conv_module = find_last_conv_layer(model.model)
+    if last_conv_name is None:
+        raise RuntimeError("No convolutional layer found for Grad-CAM.")
+
+    fmap = None
+
+    def hook_fn(module, inp, out):
+        nonlocal fmap
+        fmap = out.detach()
+
+    hook = last_conv_module.register_forward_hook(hook_fn)
+
+    try:
+        # Forward pass
+        logits = model(img_tensor)  # (1, 2)
+        probs = torch.nn.functional.softmax(logits, dim=1)
+
+        # Backward pass for target class
+        model.zero_grad()
+        target_score = logits[0, target_class]
+        target_score.backward()
+
+        # Get gradients w.r.t. feature maps
+        grads = img_tensor.grad  # not used directly
+        # We need gradients of the feature maps, not input
+        # So we access grads via last_conv_module's output
+        # Instead, we recompute using a custom hook on gradients
+    finally:
+        hook.remove()
+
+    # Better approach: use a hook that captures both output and gradient
+    fmap = None
+    grad = None
+
+    def forward_hook(module, inp, out):
+        nonlocal fmap
+        fmap = out.detach()
+
+    def backward_hook(module, grad_in, grad_out):
+        nonlocal grad
+        grad = grad_out[0].detach()
+
+    hook_f = last_conv_module.register_forward_hook(forward_hook)
+    hook_b = last_conv_module.register_full_backward_hook(backward_hook)
+
+    try:
+        model.zero_grad()
+        img_tensor = img_tensor.detach().requires_grad_(True)
+        logits = model(img_tensor)
+        target_score = logits[0, target_class]
+        target_score.backward()
+    finally:
+        hook_f.remove()
+        hook_b.remove()
+
+    if fmap is None or grad is None:
+        raise RuntimeError("Grad-CAM feature map or gradient is None.")
+
+    # fmap: (1, C, H_f, W_f)
+    # grad: (1, C, H_f, W_f)
+    pooled_grad = torch.mean(grad, dim=(2, 3), keepdim=True)  # (1, C, 1, 1)
+    fmap = fmap[0]  # (C, H_f, W_f)
+    pooled_grad = pooled_grad[0]  # (C, 1, 1)
+
+    weighted_map = torch.sum(fmap * pooled_grad.squeeze(), dim=0)  # (H_f, W_f)
+
+    heatmap = weighted_map.cpu().numpy()
+    heatmap = np.maximum(heatmap, 0)
+    if heatmap.max() != 0:
+        heatmap /= heatmap.max()
+
+    # Resize to 512x512
+    heatmap = cv2.resize(heatmap, (512, 512))
+
+    return heatmap
+
+
+def apply_gradcam_overlay(image_pil, heatmap):
+    """
+    image_pil: original PIL image
+    heatmap: 2D numpy array (512, 512), values in [0, 1]
+    """
+    original = np.array(image_pil.resize((512, 512)))
+
+    heatmap_color = cv2.applyColorMap(
+        np.uint8(255 * heatmap),
+        cv2.COLORMAP_JET
+    )
+    heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
+
+    overlay = cv2.addWeighted(
+        original.astype("float32"),
+        0.6,
+        heatmap_color.astype("float32"),
+        0.4,
+        0
+    )
+    overlay = np.clip(overlay, 0, 255).astype("uint8")
+    return overlay
 
 
 # --------------------------------------------------
@@ -368,9 +493,20 @@ def dashboard_page():
 
             st.subheader("Grad-CAM")
 
-            st.info(
-                "Explainability heatmap will be added after the main inference pipeline is verified."
-            )
+            with st.spinner("Computing Grad-CAM..."):
+                try:
+                    heatmap = compute_gradcam(
+                        clf_model,
+                        img_tensor,
+                        target_class=pred_class
+                    )
+                    overlay = apply_gradcam_overlay(image, heatmap)
+                    st.image(overlay, caption="Grad-CAM overlay", use_container_width=True)
+                except Exception as e:
+                    st.error(f"Grad-CAM failed: {e}")
+                    st.info(
+                        "Classification and detection still work; Grad-CAM is optional."
+                    )
 
         # Detection
 
